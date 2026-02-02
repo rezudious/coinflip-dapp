@@ -49,6 +49,9 @@ contract CoinFlip is VRFConsumerBaseV2Plus {
     /// @notice Accumulated flat fees available for owner withdrawal
     uint256 public accumulatedFees;
 
+    /// @notice Reentrancy guard
+    uint256 private _reentrancyGuard; // slot for reentrancy guard
+
     // ============ VRF config (Base Sepolia) ============
 
     uint256 internal s_subscriptionId;
@@ -81,6 +84,18 @@ contract CoinFlip is VRFConsumerBaseV2Plus {
     );
 
     event FeesWithdrawn(address indexed to, uint256 amount);
+
+    event DetailedGameResolution(
+        uint256 indexed gameId,
+        address indexed creator,
+        address indexed joiner,
+        uint256 betAmount,
+        uint256 flatFee,
+        Choice joinerChoice,
+        Choice coinFlipResult,
+        address winner,
+        uint256 amountPaid
+    );
 
     // ============ Errors ============
 
@@ -117,6 +132,7 @@ contract CoinFlip is VRFConsumerBaseV2Plus {
      */
     function createGame(uint256 _betAmount, uint256 _flatFee) external payable {
         if (_betAmount == 0) revert InvalidBetAmount();
+        if (_betAmount < 0.001 ether || _betAmount > 10 ether) revert InvalidBetAmount();
         if (_flatFee == 0) revert InvalidFlatFee();
         if (msg.value != _betAmount + _flatFee) revert InvalidValue();
 
@@ -176,10 +192,16 @@ contract CoinFlip is VRFConsumerBaseV2Plus {
      * @notice Called by the VRF coordinator with the random value. Resolves the game and pays the winner.
      * @dev Winner receives the pot (2 * betAmount). The flat fee stays in the contract and accumulates for owner withdrawal.
      */
+    
+
     function fulfillRandomWords(
         uint256 requestId,
         uint256[] calldata randomWords
     ) internal override {
+        // Reentrancy guard
+        require(_reentrancyGuard == 0, "Reentrancy not allowed");
+        _reentrancyGuard = 1;
+
         uint256 gameId = requestIdToGameId[requestId];
         Game storage g = games[gameId];
         assert(g.status == GameStatus.Pending);
@@ -195,11 +217,28 @@ contract CoinFlip is VRFConsumerBaseV2Plus {
         g.status = GameStatus.Resolved;
         accumulatedFees += fee;
 
-        (bool ok, ) = winner.call{value: pot}("");
-        if (!ok) revert TransferFailed();
-
         emit GameResolved(gameId, winner, result);
+        emit DetailedGameResolution(
+            gameId,
+            g.creator,
+            g.joiner,
+            betAmount,
+            fee,
+            g.choice,
+            result,
+            winner,
+            pot
+        );
+
+        (bool ok, ) = winner.call{value: pot}("");
+        if (!ok) {
+            _reentrancyGuard = 0;
+            revert TransferFailed();
+        }
+
+        _reentrancyGuard = 0;
     }
+
 
     // ============ External: Owner ============
 
